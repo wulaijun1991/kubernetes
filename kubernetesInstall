@@ -1,0 +1,811 @@
+1. 集群信息
+    k8s-master01	192.168.10.241 (k8s-etcd01)
+    k8s-master02	192.168.10.242
+    k8s-etcd02		192.168.10.x1
+    k8s-etcd03		192.168.10.x2
+    k8s-node01		192.168.10.222
+    k8s-node02		192.168.10.245
+
+2. 系统初始化
+	systemctl stop firewalld	#关闭防火墙
+	systemctl disable firewalld	#禁止防火墙开机自启
+	
+	sed -i 's/enforcing/disabled/' /etc/selinux/config	#永久关闭selinux
+	
+	sed -ri 's/.*swap.*/#&/' /etc/fstab	#永久关闭swap分区
+    
+    vi /etc/hostname    #编辑该文件，按照集群信息中的主机名设置主机名
+    
+    reboot  #重启生效
+    
+    #在每个节点上的hosts文件中添加如下信息
+    cat >> /etc/hosts << EOF
+    k8s-master		192.168.10.241
+    k8s-master02	192.168.10.242
+    k8s-etcd02		192.168.10.x1
+    k8s-etcd03		192.168.10.x2
+    k8s-node01		192.168.10.222
+    k8s-node02		192.168.10.245
+    EOF
+    
+    #编辑/etc/resolv.conf文件，添加如下信息：
+    nameserver 8.8.8.8
+        
+    #将桥接的IPv4流量传递到iptables的链
+    cat > /etc/sysctl.d/k8s.conf << EOF
+    net.bridge.bridge-nf-call-ip6tables = 1
+    net.bridge.bridge-nf-call-iptables = 1
+    net.ipv4.ip_forward = 1
+    vm.swappiness = 0
+    EOF
+    
+    # 加载br_netfilter模块
+    modprobe br_netfilter
+    
+    # 查看是否加载
+    lsmod | grep br_netfilter
+    
+    # 生效
+    sysctl --system
+    
+    #时间同步
+    yum install ntpdate -y
+    ntpdate time.windows.com
+    date    #确认时间是否已同步
+    
+    #开启ipvs
+    yum -y install ipset ipvsadm
+    
+    #在每个节点上执行如下脚本
+    cat > /etc/sysconfig/modules/ipvs.modules <<EOF
+    #!/bin/bash
+    modprobe -- ip_vs
+    modprobe -- ip_vs_rr
+    modprobe -- ip_vs_wrr
+    modprobe -- ip_vs_sh
+    modprobe -- nf_conntrack_ipv4
+    EOF
+    
+    #授权、运行、检查是否加载：
+    chmod 755 /etc/sysconfig/modules/ipvs.modules && bash /etc/sysconfig/modules/ipvs.modules && lsmod | grep -e ip_vs -e nf_conntrack_ipv4
+
+3. 所有节点安装docker
+   rpm -qa | grep docker  #查看是否有docker，如果没有则继续安装，如果有则先使用yum remove 卸载
+   
+   #安装yum仓库管理工具
+    yum -y install yum-utils
+    
+    #安装阿里的docker-ce仓库
+    yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+    
+    #查看可选择的docker-ce版本
+    yum -y install docker-ce-18.06.3.ce
+    
+    #重启docker，如果报错，则将/var/lib/docker下的文件删
+    systemctl restart docker
+    
+    #下载docker-compose
+    curl -L https://github.com/docker/compose/releases/download/1.18.0/docker-compose-`uname -s`-`uname -m` -o /usr/bin/docker-compose
+    chmod o+x /usr/bin/docker-compose
+    
+    systemctl daemon-reload
+    systemctl restart docker
+    systemctl enable docker
+    
+4. 二进制包搭建k8s集群
+   4.1. #部署etcd集群
+    k8s-master01	192.168.10.241(k8s-etcd01)
+    k8s-etcd02		192.168.10.x1
+    k8s-etcd03		192.168.10.x2
+
+    
+   4.1.1 #准备cfssl证书生成工具(以下步骤在master01上执行)
+    cd /usr/local/src   #存放文件的目录
+    wget https://pkg.cfssl.org/R1.2/cfssl_linux-amd64
+    wget https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64
+    wget https://pkg.cfssl.org/R1.2/cfssl-certinfo_linux-amd64
+    chmod +x cfssl_linux-amd64 cfssljson_linux-amd64 cfssl-certinfo_linux-amd64
+    mv cfssl_linux-amd64 /usr/local/bin/cfssl
+    mv cfssljson_linux-amd64 /usr/local/bin/cfssljson
+    mv cfssl-certinfo_linux-amd64 /usr/bin/cfssl-certinfo
+    
+    4.1.2 #生成etcd证书
+    #自签证书颁发机构（CA）
+    #创建工作目录
+    mkdir -pv ~/TLS/{etcd,k8s}
+    cd ~/TLS/etcd
+    cat > ca-config.json <<EOF
+    {
+      "signing": {
+        "default": {
+          "expiry": "87600h"
+        },
+        "profiles": {
+          "www": {
+            "expiry": "87600h",
+            "usages": [
+              "signing",
+              "key encipherment",
+              "server auth",
+              "client auth"
+            ]
+          }
+        }
+      }
+    }
+    EOF
+        
+    cat > ca-csr.json <<EOF
+    {
+      "CN": "etcd CA",
+      "key": {
+        "algo": "rsa",
+        "size": 2048
+      },
+      "names": [
+        {
+          "C": "CN",
+          "L": "Beijing",
+          "ST": "Beijing"
+        }
+      ]
+    }
+    EOF
+    
+    #生成证书
+    cfssl gencert -initca ca-csr.json | cfssljson -bare ca -
+    
+    #查看生成证书
+    ls -l *pem
+    
+    #使用自签CA签发etcd的https证书
+    #创建证书申请文件
+    cat > server-csr.json <<EOF
+    {
+      "CN": "etcd",
+      "hosts": [
+        "127.0.0.1",
+        "192.168.10.241",
+        "192.168.10.222",
+        "192.168.10.245"
+      ],
+      "key": {
+        "algo": "rsa",
+        "size": 2048
+      },
+      "names": [
+        {
+          "C": "CN",
+          "L": "BeiJing",
+          "ST": "BeiJing"
+        }
+      ]
+    }
+    EOF
+    
+    #生成证书
+    cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=www server-csr.json | cfssljson -bare server
+    
+    #查看生成证书
+    ls -l server*pem
+    
+    4.1.3 #部署etcd集群
+        #下载etcd二进制包
+        cd /usr/local/src
+        wget https://github.com/etcd-io/etcd/releases/download/v3.4.9/etcd-v3.4.9-linux-amd64.tar.gz
+        
+        #在master创建工作目录并解压二进制包
+        k8s-master01	192.168.10.241(k8s-etcd01)
+        
+        mkdir -pv /opt/etcd/{bin,cfg,ssl}
+        tar -zxvf etcd-v3.4.9-linux-amd64.tar.gz
+        mv etcd-v3.4.9-linux-amd64/{etcd,etcdctl} /opt/etcd/bin/
+        
+        #创建etcd配置文件
+        cat > /opt/etcd/cfg/etcd.conf << EOF
+        #[Member] 
+        ETCD_NAME="etcd-1"  
+        ETCD_DATA_DIR="/var/lib/etcd/default.etcd" 
+        ETCD_LISTEN_PEER_URLS="https://192.168.10.241:2380" 
+        ETCD_LISTEN_CLIENT_URLS="https://192.168.10.x1:2379" 
+
+        #[Clustering]
+        ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.10.241:2380" 
+        ETCD_ADVERTISE_CLIENT_URLS="https://192.168.10.241:2379" 
+        ETCD_INITIAL_CLUSTER="etcd-1=https://192.168.10.241:2380,etcd-2=https://192.168.10.x1:2380,etcd-3=https://192.168.10.x2:2380" 
+        ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster" 
+        ETCD_INITIAL_CLUSTER_STATE="new" 
+        EOF
+        
+        #systemd管理etcd
+        cat > /usr/lib/systemd/system/etcd.service << EOF
+        [Unit]
+        Description=Etcd Server
+        After=network.target
+        After=network-online.target
+        Wants=network-online.targcaet
+        [Service]
+        Type=notify
+        EnvironmentFile=/opt/etcd/cfg/etcd.conf
+        ExecStart=/opt/etcd/bin/etcd \
+        --cert-file=/opt/etcd/ssl/server.pem \
+        --key-file=/opt/etcd/ssl/server-key.pem \
+        --peer-cert-file=/opt/etcd/ssl/server.pem \
+        --peer-key-file=/opt/etcd/ssl/server-key.pem \
+        --trusted-ca-file=/opt/etcd/ssl/ca.pem \
+        --peer-trusted-ca-file=/opt/etcd/ssl/ca.pem \
+        --logger=zap
+        Restart=on-failure
+        LimitNOFILE=65536
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        #拷贝刚才生成的证书
+        cp ~/TLS/etcd/ca*pem ~/TLS/etcd/server*pem /opt/etcd/ssl/
+        
+        #将ectd拷贝到k8s-etcd02、k8s-etcd02
+        scp -r /opt/etcd/ root@192.168.10.x1:/opt/
+        scp /usr/lib/systemd/system/etcd.service root@192.168.10.x1:/usr/lib/systemd/system/
+        
+        scp -r /opt/etcd/ root@192.168.10.x2:/opt/
+        scp /usr/lib/systemd/system/etcd.service root@192.168.10.x2:/usr/lib/systemd/system/
+        
+        #登录k8s-etcd02、k8s-etcd02节点，做如下操作：
+        #修改node节点中etcd.conf配置文件中节点名称和当前服务器的IP
+        
+        #k8s-etcd02
+        vim /opt/etcd/cfg/etcd.conf
+        #[Member]  
+        ETCD_NAME="etcd-2"  
+        ETCD_DATA_DIR="/var/lib/etcd/default.etcd" 
+        ETCD_LISTEN_PEER_URLS="https://192.168.10.x1:2380" 
+        ETCD_LISTEN_CLIENT_URLS="https://192.168.10.x1:2379" 
+
+        #[Clustering]
+        ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.10.x1:2380" 
+        ETCD_ADVERTISE_CLIENT_URLS="https://192.168.10.x1:2379"
+        ETCD_INITIAL_CLUSTER="etcd-1=https://192.168.10.241:2380,etcd-2=https://192.168.10.x1:2380,etcd-3=https://192.168.10.x2:2380" 
+        ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+        ETCD_INITIAL_CLUSTER_STATE="new" 
+        
+        
+        #k8s-etcd03
+        vim /opt/etcd/cfg/etcd.conf
+        #[Member]  
+        ETCD_NAME="etcd-2"  
+        ETCD_DATA_DIR="/var/lib/etcd/default.etcd" 
+        ETCD_LISTEN_PEER_URLS="https://192.168.10.x2:2380" 
+        ETCD_LISTEN_CLIENT_URLS="https://192.168.10.x1:2379" 
+
+        #[Clustering]
+        ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.10.x2:2380" 
+        ETCD_ADVERTISE_CLIENT_URLS="https://192.168.10.x2:2379"
+        ETCD_INITIAL_CLUSTER="etcd-1=https://192.168.10.241:2380,etcd-2=https://192.168.10.x1:2380,etcd-3=https://192.168.10.x2:2380" 
+        ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+        ETCD_INITIAL_CLUSTER_STATE="new" 
+        
+        #每个节点启动并设置开机启动
+        systemctl daemon-reload
+        systemctl start etcd
+        systemctl enable etcd
+        
+        #每个节点查看集群状态
+        systemctl status etcd.service
+        
+    4.1.4 #为ApI Server自签证书
+        #自签证书颁发机构（CA）
+        cd ~/TLS/k8s/
+        cat > ca-config.json <<EOF
+        {
+          "signing": {
+            "default": {
+              "expiry": "87600h"
+            },
+            "profiles": {
+              "kubernetes": {
+                 "expiry": "87600h",
+                 "usages": [
+                    "signing",
+                    "key encipherment",
+                    "server auth",
+                    "client auth"
+                ]
+              }
+            }
+          }
+        }
+        EOF
+          
+          
+        cat > ca-csr.json <<EOF
+        {
+            "CN": "kubernetes",
+            "key": {
+                "algo": "rsa",
+                "size": 2048
+            },
+            "names": [
+                {
+                    "C": "CN",
+                    "L": "Beijing",
+                    "ST": "Beijing"
+                }
+            ]
+        }
+        EOF
+        
+        #生成证书
+        cfssl gencert -initca ca-csr.json | cfssljson -bare ca -
+        
+        #查看生成的证书
+        ll *pem
+        
+        #使用自签CA签发etcd的https证书
+        #创建证书申请文件
+        cat > kube-proxy-csr.json << EOF
+        {
+          "CN": "system:kube-proxy",
+          "hosts": [],
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "CN",
+              "L": "BeiJing",
+              "ST": "BeiJing"
+            }
+          ]
+        }
+        EOF
+        
+        cat > server-csr.json<< EOF
+        {
+            "CN": "kubernetes",
+            "hosts": [
+              "10.0.0.1",
+              "127.0.0.1",
+              "kubernetes",
+              "kubernetes.default",
+              "kubernetes.default.svc",
+              "kubernetes.default.svc.cluster",
+              "kubernetes.default.svc.cluster.local",
+              "192.168.10.120",
+              "192.168.10.122",
+              "192.168.10.123"
+            ],
+            "key": {
+                "algo": "rsa",
+                "size": 2048
+            },
+            "names": [
+                {
+                    "C": "CN",
+                    "L": "BeiJing",
+                    "ST": "BeiJing"
+                }
+            ]
+        }
+        EOF
+        
+    #生成证书
+    cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes server-csr.json | cfssljson -bare server
+    cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-proxy-csr.json | cfssljson -bare kube-proxy
+    
+    5.1 #部署Master组件
+    5.1.1 #下载并解压二进制包
+        mkdir -pv /opt/kubernetes/{bin,cfg,ssl,logs}
+        cd /usr/local/src
+        wget "https://dl.k8s.io/v1.18.10/kubernetes-server-linux-amd64.tar.gz"
+        tar -zxvf kubernetes-server-linux-amd64.tar.gz
+        cd kubernetes/server/bin
+        cp kube-apiserver kube-scheduler kube-controller-manager /opt/kubernetes/bin
+        cp kubectl /usr/bin/
+        
+    5.1.2 #部署kube-apiserver
+        #创建配置文件
+        cat > /opt/kubernetes/cfg/kube-apiserver.conf << EOF
+        KUBE_APISERVER_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --etcd-servers=https://192.168.10.120:2379,https://192.168.10.122:2379,https://192.168.10.123:2379 \\
+        --bind-address=192.168.10.120 \\
+        --secure-port=6443 \\
+        --advertise-address=192.168.10.120 \\
+        --allow-privileged=true \\
+        --service-cluster-ip-range=10.0.0.0/24 \\
+        --enable-admission-plugins=NamespaceLifecycle,LimitRanger,ServiceAccount,ResourceQuota,NodeRestriction \\
+        --authorization-mode=RBAC,Node \\
+        --enable-bootstrap-token-auth=true \\
+        --token-auth-file=/opt/kubernetes/cfg/token.csv \\
+        --service-node-port-range=30000-32767 \\
+        --kubelet-client-certificate=/opt/kubernetes/ssl/server.pem \\
+        --kubelet-client-key=/opt/kubernetes/ssl/server-key.pem \\
+        --tls-cert-file=/opt/kubernetes/ssl/server.pem \\
+        --tls-private-key-file=/opt/kubernetes/ssl/server-key.pem \\
+        --client-ca-file=/opt/kubernetes/ssl/ca.pem \\
+        --service-account-key-file=/opt/kubernetes/ssl/ca-key.pem \\
+        --etcd-cafile=/opt/etcd/ssl/ca.pem \\
+        --etcd-certfile=/opt/etcd/ssl/server.pem \\
+        --etcd-keyfile=/opt/etcd/ssl/server-key.pem \\
+        --audit-log-maxage=30 \\
+        --audit-log-maxbackup=3 \\
+        --audit-log-maxsize=100 \\
+        --audit-log-path=/opt/kubernetes/logs/k8s-audit.log"
+        EOF
+        
+    #复制刚才生成的文件到配置文件所在路径
+    cp ~/TLS/k8s/ca*pem ~/TLS/k8s/server*pem ~/TLS/k8s/kube-proxy*pem /opt/kubernetes/ssl/
+    
+    5.1.3 #启用TLS Bootstrapping机制
+        #制作token令牌(注意：记得保存生成后的token，后面会用到)（ef044ee194fd787e420a215798f5864c）
+        head -c 16 /dev/urandom | od -An -t x | tr -d ' '
+        
+        #创建token文件
+        cat > /opt/kubernetes/cfg/token.csv << EOF
+        ef044ee194fd787e420a215798f5864c,kubelet-bootstrap,10001,"system:nodebootstrapper"
+        EOF
+                
+            5.1.4 #systemd管理apiserver
+        cat > /usr/lib/systemd/system/kube-apiserver.service << EOF
+        [Unit]
+        Description=Kubernetes API Server
+        Documentation=https://github.com/kubernetes/kubernetes
+        [Service]
+        EnvironmentFile=/opt/kubernetes/cfg/kube-apiserver.conf
+        ExecStart=/opt/kubernetes/bin/kube-apiserver \$KUBE_APISERVER_OPTS
+        Restart=on-failure
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        #启动apiserver并设置开机启动
+        systemctl daemon-reload
+        systemctl start kube-apiserver
+        systemctl enable kube-apiserver
+        
+    5.1.5 #部署kube-controller-manager
+        #创建配置文件
+        cat > /opt/kubernetes/cfg/kube-controller-manager.conf << EOF
+        KUBE_CONTROLLER_MANAGER_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --leader-elect=true \\
+        --master=127.0.0.1:8080 \\
+        --bind-address=127.0.0.1 \\
+        --allocate-node-cidrs=true \\
+        --cluster-cidr=10.244.0.0/16 \\
+        --service-cluster-ip-range=10.0.0.0/24 \\
+        --cluster-signing-cert-file=/opt/kubernetes/ssl/ca.pem \\
+        --cluster-signing-key-file=/opt/kubernetes/ssl/ca-key.pem \\
+        --root-ca-file=/opt/kubernetes/ssl/ca.pem \\
+        --service-account-private-key-file=/opt/kubernetes/ssl/ca-key.pem \\
+        --experimental-cluster-signing-duration=87600h0m0s"
+        EOF
+        
+    5.1.6 #systemd管理controller-manager
+        cat > /usr/lib/systemd/system/kube-controller-manager.service << EOF
+        [Unit]
+        Description=Kubernetes Controller Manager
+        Documentation=https://github.com/kubernetes/kubernetes
+
+        [Service]
+        EnvironmentFile=/opt/kubernetes/cfg/kube-controller-manager.conf
+        ExecStart=/opt/kubernetes/bin/kube-controller-manager \$KUBE_CONTROLLER_MANAGER_OPTS
+        Restart=on-failure
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        #启动controller-manager并设置开机启动
+        systemctl daemon-reload
+        systemctl start kube-controller-manager
+        systemctl enable kube-controller-manager
+        
+    5.1.7 #部署kube-scheduler
+        #创建配置文件
+        cat > /opt/kubernetes/cfg/kube-scheduler.conf << EOF
+        KUBE_SCHEDULER_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --leader-elect=true \\\
+        --master=127.0.0.1:8080 \\
+        --bind-address=127.0.0.1"
+        EOF
+        
+    5.1.7 #systemd管理scheduler
+        cat > /usr/lib/systemd/system/kube-scheduler.service << EOF
+        [Unit]
+        Description=Kubernetes Scheduler
+        Documentation=https://github.com/kubernetes/kubernetes
+        [Service]
+        EnvironmentFile=/opt/kubernetes/cfg/kube-scheduler.conf
+        ExecStart=/opt/kubernetes/bin/kube-scheduler \$KUBE_SCHEDULER_OPTS
+        Restart=on-failure 
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        #启动scheduler并设置开机启动
+        systemctl daemon-reload
+        systemctl start kube-scheduler
+        systemctl enable kube-scheduler
+        
+    5.1.8 #查看集群状态
+        #所有组件都已经启动成功，通过kubectl工具查看当前集群的组件状态
+        kubectl get cs
+        
+        
+    6.1 #部署Node组件
+    6.1.1 #在所有Node节点创建工作目录(不包括etcd节点)
+        mkdir -pv /opt/kubernetes/{bin,cfg,ssl,logs}
+        
+    6.1.2 #从Master节点拷贝二进制文件
+        cd /usr/local/src/kubernetes/server/bin     #kubernetes 解压目录
+        scp kubelet  kube-proxy root@192.168.10.222:/opt/kubernetes/bin
+        scp kubelet  kube-proxy root@192.168.10.245:/opt/kubernetes/bin
+        scp -r /opt/kubernetes/ssl/ root@192.168.10.222:/opt/kubernetes/ssl
+        scp -r /opt/kubernetes/ssl/ root@192.168.10.245:/opt/kubernetes/ssl
+        
+    6.1.3 #在Master节点生成bootstrap.kubeconfig和kube-proxy.kubeconfig文件
+        #创建配置文件
+        cat > ~/configure.sh << EOF
+        #! /bin/bash
+        # create TLS Bootstrapping Token
+        #----------------
+        #创建  kubelet bootstrapping 配置文件
+        export PATH=$PATH:/opt/kubernetes/bin
+        export KUBE_APISERVER="https://192.168.10.241:6443"
+        export BOOTSTRAP_TOKEN="67a54483f471b657b58d6dbb0717e393"   #制作token令牌所得的token
+        #创建绑定角色
+        kubectl create clusterrolebinding kubelet-bootstrap \
+          --clusterrole=system:node-bootstrapper \
+          --user=kubelet-bootstrap
+        # 设置 cluster 参数
+        kubectl config set-cluster kubernetes \
+          --certificate-authority=/opt/kubernetes/ssl/ca.pem \
+          --embed-certs=true \
+          --server=\${KUBE_APISERVER} \
+          --kubeconfig=bootstrap.kubeconfig
+
+        # 设置客户端认证参数
+        kubectl config set-credentials kubelet-bootstrap \
+          --token=\${BOOTSTRAP_TOKEN} \
+          --kubeconfig=bootstrap.kubeconfig
+
+        #设置上下文
+        kubectl config set-context default \
+          --cluster=kubernetes \
+          --user=kubelet-bootstrap \
+          --kubeconfig=bootstrap.kubeconfig
+
+        kubectl config use-context default --kubeconfig=bootstrap.kubeconfig
+        #-------------
+        #创建 kube-proxy 配置文件
+        kubectl config set-cluster kubernetes \
+          --certificate-authority=/opt/kubernetes/ssl/ca.pem \
+          --embed-certs=true \
+          --server=\${KUBE_APISERVER} \
+          --kubeconfig=kube-proxy.kubeconfig
+
+        kubectl config set-credentials kube-proxy \
+          --client-certificate=/opt/kubernetes/ssl/kube-proxy.pem \
+          --client-key=/opt/kubernetes/ssl/kube-proxy-key.pem \
+          --embed-certs=true \
+          --kubeconfig=kube-proxy.kubeconfig
+
+        kubectl config set-context default \
+          --cluster=kubernetes \
+          --user=kube-proxy \
+          --kubeconfig=kube-proxy.kubeconfig
+
+        kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig
+
+        EOF
+        
+        #执行脚本，并将bootstrap.kubeconfig和kube-proxy.kubeconfig文件复制到所有的Node节点（kubectl delete clusterrolebinding kubelet-bootstrap）
+        sh configure.sh
+        scp bootstrap.kubeconfig  kube-proxy.kubeconfig root@192.168.10.222:/opt/kubernetes/cfg
+        scp bootstrap.kubeconfig  kube-proxy.kubeconfig root@192.168.10.245:/opt/kubernetes/cfg
+        
+    6.1.4 #所有Node节点部署kubelet
+        #对192.168.10.222节点来说，需要创建如下文件
+        cat > /opt/kubernetes/cfg/kubelet.conf << EOF
+        KUBELET_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --hostname-override=k8s-node01 \\           #这里需要修改名字
+        --network-plugin=cni \\
+        --kubeconfig=/opt/kubernetes/cfg/kubelet.kubeconfig \\
+        --bootstrap-kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig \\
+        --cert-dir=/opt/kubernetes/ssl \\
+        --pod-infra-container-image=registry.cn-hangzhou.aliyuncs.com/google-containers/pause-amd64:3.0"
+        EOF
+        
+        #对192.168.10.245节点来说，需要创建如下文件
+        cat > /opt/kubernetes/cfg/kubelet.conf << EOF
+        KUBELET_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --hostname-override=k8s-node02 \\
+        --network-plugin=cni \\
+        --kubeconfig=/opt/kubernetes/cfg/kubelet.kubeconfig \\
+        --bootstrap-kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig \\
+        --cert-dir=/opt/kubernetes/ssl \\
+        --pod-infra-container-image=registry.cn-hangzhou.aliyuncs.com/google-containers/pause-amd64:3.0"
+        EOF
+       
+       
+    6.1.5 #所有Node节点systemd管理kubelet
+        cat > /usr/lib/systemd/system/kubelet.service << EOF
+        [Unit]
+        Description=Kubernetes Kubelet
+        After=docker.service
+        [Service]
+        EnvironmentFile=/opt/kubernetes/cfg/kubelet.conf
+        ExecStart=/opt/kubernetes/bin/kubelet \$KUBELET_OPTS
+        Restart=on-failure
+        LimitNOFILE=65536
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        #所有Node节点启动kubelet并设置开机自启
+        systemctl daemon-reload
+        systemctl enable kubelet
+        systemctl start kubelet
+        
+    6.1.6 #为所有Node节点部署kube-proxy
+        #对192.168.10.222节点来说，需要创建如下文件
+        cat > /opt/kubernetes/cfg/kube-proxy.conf << EOF
+        KUBE_PROXY_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig \\
+        --hostname-override=k8s-node01" 
+        EOF
+        
+        #对192.168.10.245节点来说，需要创建如下文件
+        cat > /opt/kubernetes/cfg/kube-proxy.conf << EOF
+        KUBE_PROXY_OPTS="--logtostderr=false \\
+        --v=2 \\
+        --log-dir=/opt/kubernetes/logs \\
+        --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig \\
+        --hostname-override=k8s-node02" 
+        EOF
+        
+        #所有Node节点systemd管理kube-proxy
+        cat > /usr/lib/systemd/system/kube-proxy.service << EOF
+        [Unit]
+        Description=Kubernetes Proxy
+        After=network.target
+        [Service]
+        EnvironmentFile=/opt/kubernetes/cfg/kube-proxy.conf
+        ExecStart=/opt/kubernetes/bin/kube-proxy \$KUBE_PROXY_OPTS
+        Restart=on-failure
+        LimitNOFILE=65536
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+    
+        #所有Node节点启动kube-proxy并设置开机自启
+        systemctl daemon-reload
+        systemctl enable kube-proxy
+        systemctl start kube-proxy
+        
+    6.1.7 #部署CNI网络插件—calico
+        #在Master节点上执行
+        wget https://docs.projectcalico.org/v3.1/getting-started/kubernetes/installation/rbac.yaml
+        wget https://docs.projectcalico.org/v3.1/getting-started/kubernetes/installation/hosted/calico.yaml
+        
+        #部署pod到节点
+        kubectl apply -f rbac.yaml
+        kubectl apply -f calico.yaml
+        
+        #查看进度
+        kubectl get pods --namespace kube-system
+        kubectl get svc --namespace kube-system
+        
+        #Calico 问题排障
+        #错误信息
+        Readiness probe failed: caliconode is not ready: BIRD is not ready: BGP not established with 192.168.10.254
+        
+        #原因
+        官方提供的yaml文件中，ip识别策略（IPDETECTMETHOD）没有配置，即默认为first-found，这会导致一个网络异常的ip作为nodeIP被注册，从而影响node-to-node mesh。我们可以修改成can-reach或者interface的策略，尝试连接某一个Ready的node的IP，以此选择出正确的IP。
+        vi calico.yaml  #编辑该文件，在name: CLUSTER_TYPE  value: "k8s,bgp" 后面添加如下信息
+        - name: IP_AUTODETECTION_METHOD
+          value: "interface=ens.*"  #让其匹配ens开头的网卡
+          
+        #重新让其生效
+        kubectl apply -f calico.yaml
+        
+        
+    6.1.8 #在Master批量新Node kubelet证书申请
+        kubectl get csr
+        kubectl certificate approve {NAME}
+        
+        
+    7.1 #安装dashboard
+        #创建证书
+            mkdir dashboard-certs
+            cd dashboard-certs/
+            
+            #创建命名空间
+            kubectl create namespace kubernetes-dashboard
+            openssl genrsa -out dashboard.key 2048
+
+            #证书请求
+            openssl req -days 36000 -new -out dashboard.csr -key dashboard.key -subj '/CN=dashboard-cert'
+
+            #自签证书
+            openssl x509 -req -in dashboard.csr -signkey dashboard.key -out dashboard.crt
+
+            #创建kubernetes-dashboard-certs对象
+            kubectl create secret generic kubernetes-dashboard-certs --from-file=dashboard.key --from-file=dashboard.crt -n kubernetes-dashboard
+            
+        #下载recommended.yaml 文件(打开这个地址进去复制)
+        cd dashboard-certs/
+        https://gitee.com/luowei_lv/bash-shell/blob/master/recommended.yaml
+        
+        #修改yaml文件 
+        #在port:443 行附近天剑如下信息：
+        vi recommended.yaml
+        type: NodePort
+        nodePort: 30001 #外部访问的端口
+        
+        #下载image
+        cat recommended.yaml | grep image   #查看yaml文件中的image，可以发现该文件所需镜像是 kubernetesui/dashboard:v2.0.0-beta5
+        docker pull kubernetesui/dashboard:v2.0.0-beta5
+        
+        #安装dashboard到pod
+        kubectl apply -f recommended.yaml   #让配置文件生效
+        kubectl get pods,svc -n kube-system  -o wide -A  #查看pods、svc#查看pods、svc，查看dashboard运行在哪个节点
+        
+        #修改node上kubelet的配置文件(/opt/kubernetes/cfg/kubelet.conf )，在该文件中增加如下信息：
+        --cluster-dns=10.0.0.100 --cluster-domain=cluster.local \   #这里的10.0.0.100只要与master上  kubectl get svc 看到的ClusterIP在同一个网段即可
+        
+        #重启kubelet
+        systemctl restart kubelet
+        
+        #访问dashboard
+        https://node_ip:30001   #这里的node_ip 是指dashboard所在的节点IP
+        
+        #获取token
+        kubectl get secret -n kube-system |grep dashboard-admin
+        kubectl describe secret ${token} -n kube-system     #这里的token是上面查询出来的secret名字
+    
+    8.1 #安装DNS(kubernetes 1.11之前使用kube-dns，kubernetes1.11之后使用coredns)
+        #下载core-dns
+        git clone https://github.com/coredns/deployment.git
+        cd deployment/kubernetes
+        ./deploy.sh -i 10.0.0.100 -d cluster.local >coredns.yaml    #这里的10.0.0.100要与--cluster-dns=10.0.0.100一致
+        kubectl create -f .
+        kubectl get pods -o wide -A
+        
+        #测试DNS解析是否正常
+        vi test_dns_pod.yaml
+        
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          labels:
+            name: busybox
+            role: master
+          name: busybox
+        spec:
+          containers:
+          - name: busybox
+            image: docker.io/busybox:1.28.4
+            imagePullPolicy: IfNotPresent
+            command:
+            - sleep
+            - "3600"
+            
+        kubectl create -f test_dns_pod.yaml
+        kubectl get pods -o wide -A  #查看部署是否成功
+        
+        kubectl exec -ti busybox -- nslookup baidu.com  #进入busybox pod里面，使用nslookup 解析baidu.com是否成功
+        kubectl exec -ti busybox -- nslookup kubernetes.default #进入busybox pod里面，使用nslookup 解析kubernetes.default是否成功
