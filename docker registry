@@ -1,0 +1,96 @@
+#docker 搭建私有仓库
+1. registry 的搭建
+    docker pull registry:2
+    docker run -d -v /opt/registry:/var/lib/registry -p 5000:5000 --name myregistry registry:2
+    
+    http://127.0.0.1:5000/v2 #使用浏览器浏览，出现{}表示正常
+    
+2. push 镜像到registry
+    #首先下载两个镜像
+    docker pull mysql
+    docker pull nginx
+    
+    #打tag
+    docker tag nginx:latest localhost:5000/nginx:latest
+    docker tag mysql:latest localhost:5000/mysql:latest
+    
+    #将打完tag的镜像推送到私有仓库
+    docker push localhost:5000/nginx:latest
+    docker push localhost:5000/mysql:latest
+    
+    #验证
+    http://192.168.10.180:5000/v2/_catalog
+    
+3. 升级docker到指定版本
+    #卸载老版本
+    rpm -qa | grep docker
+    yum remove $docker
+    
+    #安装yum仓库管理工具
+    yum -y install yum-utils
+    
+    #安装阿里的docker-ce仓库
+    yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+    
+    #查看可选择的docker-ce版本
+    yum -y install docker-ce-18.06.3.ce
+    
+    #重启docker，如果报错，则将/var/lib/docker下的文件删除
+    cd /var/lib/docker && rm -rf *
+    systemctl restart docker
+    
+    #下载docker-compose
+    curl -L https://github.com/docker/compose/releases/download/1.18.0/docker-compose-`uname -s`-`uname -m` -o /usr/bin/docker-compose
+    chmod o+x /usr/bin/docker-compose
+    
+4. Harbor 安装(v1.10.6)
+    docker version #查看docker版本，Harbor 对docker版本有要求，v1.10.6 版本要求docker1.7 以上
+    
+    wget https://github.com/goharbor/harbor/releases/download/v1.10.6/harbor-offline-installer-v1.10.6.tgz
+    
+    tar -zxvf harbor-offline-installer-v1.10.6.tgz
+    
+    cd harbor
+    
+    vi harbor.yml  #编辑该文件
+    hostname: 192.168.10.180    #修改hostname
+    
+    #注释以下信息
+    # https related config
+    # https:
+    # https port for harbor, default is 443
+    #  port: 443
+    # The path of cert and key files for nginx
+    #  certificate: /your/certificate/path
+    #  private_key: /your/private/key/path
+    
+    #编辑以下文件，在ExecStart后面追加--insecure-registry=http://192.168.10.180
+    vi /usr/lib/system/system/docker.service
+    ExecStart=/usr/bin/dockerd --insecure-registry=http://192.168.10.180
+    systemctl daemon-reload
+    systemctl restart docker
+    
+    ./install.sh
+    
+    #访问Harbor
+    http://192.168.10.180
+    
+    #先登录然后才能push
+    docker login 192.168.10.180
+    
+    #账户密码
+    admin/Harbor12345
+    
+    docker-compose stop/start
+    
+5. 私有仓库管理
+    #需要先在web上创建一个项目，如harbor，然后把镜像上传到该项目下
+    
+    docker tag nginx:latest 192.168.10.180/harbor/nginx:latest
+    docker tag mysql:latest 192.168.10.180/harbor/mysql:latest
+    
+    docker push 192.168.10.180/harbor/nginx:latest
+    docker push 192.168.10.180/harbor/mysql:latest
+    
+    
+docker run -dit -p 8081:80 --name nginx nginx:v3    #将镜像里面的web应用端口映射到8081
